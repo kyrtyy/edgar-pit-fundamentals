@@ -1,0 +1,21 @@
+ticker,vendor_date,ratio,filings_filed,lag_days,status
+AAPL,2014-06-09,7.0,2014-10-27,140.0,matched
+AAPL,2020-08-31,4.0,2020-10-30,60.0,matched
+AMZN,2022-06-06,20.0,2023-02-03,242.0,matched
+GOOGL,2014-04-03,1.998,,,missing_in_filings
+GOOGL,2022-07-18,20.0,2023-02-03,200.0,matched
+NVDA,2021-07-20,4.0,2022-03-18,241.0,matched
+NVDA,2024-06-10,10.0,2025-02-26,261.0,matched
+TSLA,2020-08-31,5.0,2021-02-08,161.0,matched
+TSLA,2022-08-25,3.0,2023-01-31,159.0,matched
+WMT,2024-02-26,3.0,2024-03-15,18.0,matched
+V,2015-03-19,4.0,,,missing_in_filings
+KO,2012-08-13,2.0,2013-02-27,198.0,matched
+NFLX,2015-07-15,7.0,2016-01-28,197.0,matched
+NFLX,2025-11-17,10.0,2026-01-23,67.0,matched
+AVGO,2024-07-15,10.0,2024-12-20,158.0,matched
+CMG,2024-06-26,50.0,2025-02-05,224.0,matched
+GE,2019-02-26,1.04,,,spin-off adjustment (not expected in filings)
+GE,2021-08-02,0.125,2022-02-11,193.0,matched
+GE,2023-01-04,1.281,,,spin-off adjustment (not expected in filings)
+GE,2024-04-02,1.253,,,spin-off adjustment (not expected in filings)
