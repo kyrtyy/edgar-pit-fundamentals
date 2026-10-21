@@ -6,7 +6,7 @@ Usage:
   python pit.py report                 # restatements, checks, eval -> out/
   python pit.py selftest
 """
-import json, os, sqlite3, sys, time, urllib.request
+import json, os, sqlite3, sys, time, urllib.error, urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -85,10 +85,31 @@ def ingest():
     df = (df.sort_values("prio")
             .drop_duplicates(["cik", "field", "end", "accn"])
             .drop(columns="prio"))
+    fetched = {t: fetch_vendor_splits(t) for t in COMPANIES}
+    vs = pd.DataFrame([s for t in COMPANIES for s in fetched[t] or []], columns=["ticker", "date", "ratio"])
+    cov = pd.DataFrame({"ticker": list(fetched), "covered": [v is not None for v in fetched.values()]})
     with sqlite3.connect(DB) as con:
         df.to_sql("obs", con, if_exists="replace", index=False)
         con.execute("CREATE INDEX IF NOT EXISTS ix ON obs(cik, field, end, filed)")
-    print(f"{len(df)} observations -> {DB}")
+        vs.to_sql("vendor_splits", con, if_exists="replace", index=False)
+        cov.to_sql("vendor_coverage", con, if_exists="replace", index=False)
+    print(f"{len(df)} observations, {len(vs)} vendor split events -> {DB}")
+
+
+def fetch_vendor_splits(ticker):
+    """Split events from Yahoo's (unofficial) chart API: the market-data side of the cross-check."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+           f"?period1=1230768000&period2={int(time.time())}&interval=1mo&events=split")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    time.sleep(0.5)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.load(r)["chart"]["result"]
+    except urllib.error.HTTPError:  # delisted tickers 404
+        return None
+    splits = (res or [{}])[0].get("events", {}).get("splits", {}).values()
+    return [(ticker, pd.Timestamp(s["date"], unit="s").strftime("%Y-%m-%d"),
+             s["numerator"] / s["denominator"]) for s in splits]
 
 
 # ---------- point-in-time ----------
@@ -147,6 +168,31 @@ def revisions(obs):
                                 new_form=r.form, kind=kind, split_ratio=ratio))
             prev = r
     return pd.DataFrame(out)
+
+
+def reconcile_splits(filing_splits, vendor, since="2009-06-01", max_lag=450):
+    """Match vendor split events to splits inferred from restated filings.
+    Non-integer vendor ratios (e.g. GE 1281:1000) are spin-off price adjustments, which
+    don't change share counts, so filings aren't expected to show them."""
+    rows, used = [], set()
+    for v in vendor[vendor.date >= since].itertuples():
+        r = v.ratio if v.ratio >= 1 else 1 / v.ratio
+        integer = abs(r - round(r)) < 0.01
+        cand = filing_splits[(filing_splits.ticker == v.ticker)
+                             & (abs(filing_splits.split_ratio / v.ratio - 1) < 0.02)]
+        lag = (pd.to_datetime(cand.new_filed) - pd.Timestamp(v.date)).dt.days
+        cand = cand[(lag >= 0) & (lag <= max_lag)]
+        if len(cand):
+            i = cand.index[0]; used.add(i)
+            rows.append(dict(ticker=v.ticker, vendor_date=v.date, ratio=v.ratio, filings_filed=cand.at[i, "new_filed"],
+                             lag_days=(pd.Timestamp(cand.at[i, "new_filed"]) - pd.Timestamp(v.date)).days,
+                             status="matched"))
+        else:
+            rows.append(dict(ticker=v.ticker, vendor_date=v.date, ratio=v.ratio,
+                             status="missing_in_filings" if integer else "spin-off adjustment (not expected in filings)"))
+    for f in filing_splits.drop(index=list(used)).itertuples():
+        rows.append(dict(ticker=f.ticker, ratio=f.split_ratio, filings_filed=f.new_filed, status="missing_in_vendor"))
+    return pd.DataFrame(rows)
 
 
 # ---------- quality: rules + robust z-score ----------
@@ -255,6 +301,10 @@ def report():
                  .drop_duplicates(["cik", "new_filed", "split_ratio"])
                  [["ticker", "new_filed", "split_ratio"]])
     splits.to_csv(OUT / "splits_detected.csv", index=False)
+    vendor = pd.read_sql("SELECT * FROM vendor_splits", con)
+    recon = reconcile_splits(splits, vendor)
+    no_vendor = pd.read_sql("SELECT ticker FROM vendor_coverage WHERE NOT covered", con).ticker.tolist()
+    recon.to_csv(OUT / "split_reconciliation.csv", index=False)
 
     ident = identity_breaches(snap)
     ident.to_csv(OUT / "identity_breaches.csv", index=False)
@@ -282,11 +332,14 @@ def report():
     sc = snap.groupby("ticker").agg(observations=("val", "size"), first=("end", "min"), last=("end", "max"))
     sc["identity_breaches"] = ident.groupby("ticker").size()
     sc["rule_flags"] = real_flags[real_flags.scale | real_flags.sign].groupby("ticker").size()
-    sc["anomaly_flags"] = real_flags[real_flags.z > 6].groupby("ticker").size()
+    unexplained = real_flags[(real_flags.z > 6) & ~real_flags.split_basis]
+    sc["anomaly_flags"] = unexplained.groupby("ticker").size()
     sc["restatements_other"] = rev[rev.kind.isin(["other", "amendment"])].groupby("ticker").size()
     sc = sc.fillna(0).astype({c: int for c in ["identity_breaches", "rule_flags", "anomaly_flags", "restatements_other"]})
+    # Anomaly flags are a review queue, not errors: amber once they're dense (per 100 values).
+    density = 100 * sc.anomaly_flags / sc.observations
     sc["rag"] = np.where(sc.identity_breaches + sc.rule_flags > 0, "RED",
-                np.where(sc.anomaly_flags + (sc.restatements_other > 5) > 0, "AMBER", "GREEN"))
+                np.where((density > 3) | (sc.restatements_other > 10), "AMBER", "GREEN"))
     sc.to_csv(OUT / "scorecard.csv")
 
     md = [
@@ -295,6 +348,10 @@ def report():
         f"{len(snap)} latest-known values, periods {snap.end.min()} to {snap.end.max()}.", "",
         "## Revisions of already-reported values", "", rev.kind.value_counts().to_frame("count").to_markdown(), "",
         "## Splits detected from restated share counts / EPS", "", splits.to_markdown(index=False), "",
+        "## Split reconciliation: filings vs vendor (Yahoo) split events since 2009-06", "",
+        recon.status.value_counts().to_frame("count").to_markdown(), "",
+        recon.to_markdown(index=False), "",
+        f"No vendor data (delisted): {', '.join(no_vendor) or 'none'}", "",
         f"## Accounting identity breaches (Assets vs LiabilitiesAndStockholdersEquity, >0.5%): {len(ident)}", "",
         ident.to_markdown(index=False), "",
         f"## Flags on real data (no injection): {len(real_flags)}, "
