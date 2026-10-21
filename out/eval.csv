@@ -1,0 +1,4 @@
+method,flagged,tp,precision,recall,recall_scale,recall_sign,recall_stale,recall_drift
+rules,87.2,84.2,0.966,0.431,0.992,0.726,0.0,0.0
+robust_z,350.6,125.0,0.357,0.64,1.0,0.947,0.029,0.575
+combined,351.8,126.2,0.359,0.646,1.0,0.972,0.029,0.575

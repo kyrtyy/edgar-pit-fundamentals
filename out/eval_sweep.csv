@@ -1,0 +1,11 @@
+z_thresh,method,precision,recall,recall_drift
+4,robust_z,0.228,0.676,0.686
+4,combined,0.229,0.678,0.686
+6,robust_z,0.357,0.64,0.575
+6,combined,0.359,0.646,0.575
+8,robust_z,0.44,0.594,0.441
+8,combined,0.446,0.608,0.441
+12,robust_z,0.531,0.512,0.233
+12,combined,0.543,0.55,0.233
+20,robust_z,0.628,0.435,0.045
+20,combined,0.648,0.492,0.045
