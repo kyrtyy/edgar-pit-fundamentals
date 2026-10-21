@@ -59,9 +59,10 @@ def fetch(cik):
 
 def ingest():
     tag_field = {t: (f, k, i) for f, (k, tags) in FIELDS.items() for i, t in enumerate(tags)}
-    rows = []
+    rows, names = [], {}
     for ticker, cik in COMPANIES.items():
         data = fetch(cik)
+        names[cik] = data["entityName"]
         print(f"{ticker:6} {data['entityName']}")
         for tag, body in data["facts"].get("us-gaap", {}).items():
             if tag not in tag_field:
@@ -85,19 +86,30 @@ def ingest():
     df = (df.sort_values("prio")
             .drop_duplicates(["cik", "field", "end", "accn"])
             .drop(columns="prio"))
-    fetched = {t: fetch_vendor_splits(t) for t in COMPANIES}
-    vs = pd.DataFrame([s for t in COMPANIES for s in fetched[t] or []], columns=["ticker", "date", "ratio"])
+    fetched = {t: fetch_vendor(t) for t in COMPANIES}
+    vs = pd.DataFrame([s for v in fetched.values() if v for s in v[0]], columns=["ticker", "date", "ratio"])
     cov = pd.DataFrame({"ticker": list(fetched), "covered": [v is not None for v in fetched.values()]})
+    security = fetch_figi(COMPANIES)
+    figi = dict(zip(security.ticker, security.figi))
+    price = pd.DataFrame([p for v in fetched.values() if v for p in v[1]], columns=["ticker", "month", "close_adj"])
+    price["figi"] = price.ticker.map(figi)
+    # Yahoo closes are split-adjusted; undo every split after the bar's month to get the traded price.
+    price["close_raw"] = [c * np.prod(vs.ratio[(vs.ticker == t) & (vs.date.str[:7] > m)])
+                          for t, m, c in zip(price.ticker, price.month, price.close_adj)]
+    company = pd.DataFrame({"cik": list(COMPANIES.values()), "ticker": list(COMPANIES),
+                            "name": [names[c] for c in COMPANIES.values()]})
+    filing = df[["accn", "cik", "form", "filed"]].drop_duplicates("accn")
     with sqlite3.connect(DB) as con:
-        df.to_sql("obs", con, if_exists="replace", index=False)
-        con.execute("CREATE INDEX IF NOT EXISTS ix ON obs(cik, field, end, filed)")
-        vs.to_sql("vendor_splits", con, if_exists="replace", index=False)
-        cov.to_sql("vendor_coverage", con, if_exists="replace", index=False)
-    print(f"{len(df)} observations, {len(vs)} vendor split events -> {DB}")
+        for name, t in [("company", company), ("security", security), ("filing", filing),
+                        ("fact", df), ("price", price), ("vendor_splits", vs), ("vendor_coverage", cov)]:
+            t.to_sql(name, con, if_exists="replace", index=False)
+        con.execute("CREATE INDEX IF NOT EXISTS ix ON fact(cik, field, end, filed)")
+    print(f"{len(df)} facts, {len(filing)} filings, {len(security)} securities, "
+          f"{len(price)} monthly prices, {len(vs)} vendor split events -> {DB}")
 
 
-def fetch_vendor_splits(ticker):
-    """Split events from Yahoo's (unofficial) chart API: the market-data side of the cross-check."""
+def fetch_vendor(ticker):
+    """Monthly closes and split events from Yahoo's (unofficial) chart API: the market-data side."""
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
            f"?period1=1230768000&period2={int(time.time())}&interval=1mo&events=split")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -107,9 +119,31 @@ def fetch_vendor_splits(ticker):
             res = json.load(r)["chart"]["result"]
     except urllib.error.HTTPError:  # delisted tickers 404
         return None
-    splits = (res or [{}])[0].get("events", {}).get("splits", {}).values()
-    return [(ticker, pd.Timestamp(s["date"], unit="s").strftime("%Y-%m-%d"),
-             s["numerator"] / s["denominator"]) for s in splits]
+    if not res:
+        return None
+    r = res[0]
+    splits = [(ticker, pd.Timestamp(s["date"], unit="s").strftime("%Y-%m-%d"), s["numerator"] / s["denominator"])
+              for s in r.get("events", {}).get("splits", {}).values()]
+    prices = [(ticker, pd.Timestamp(ts, unit="s").strftime("%Y-%m"), c)
+              for ts, c in zip(r.get("timestamp", []), r["indicators"]["quote"][0]["close"]) if c is not None]
+    return splits, prices
+
+
+def fetch_figi(tickers):
+    """Security master rows from OpenFIGI (no API key: 10 jobs per request)."""
+    rows, tickers = [], list(tickers)
+    for i in range(0, len(tickers), 10):
+        chunk = tickers[i:i + 10]
+        body = json.dumps([{"idType": "TICKER", "idValue": t, "exchCode": "US"} for t in chunk]).encode()
+        req = urllib.request.Request("https://api.openfigi.com/v3/mapping", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            for t, res in zip(chunk, json.load(r)):
+                for d in res.get("data", [])[:1]:  # delisted tickers return a warning, no data
+                    rows.append(dict(figi=d["figi"], share_class_figi=d.get("shareClassFIGI"), ticker=t,
+                                     cik=COMPANIES[t], name=d["name"], security_type=d.get("securityType")))
+        time.sleep(3)
+    return pd.DataFrame(rows)
 
 
 # ---------- point-in-time ----------
@@ -120,7 +154,7 @@ def fetch_vendor_splits(ticker):
 ASOF_SQL = """
 SELECT * FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY cik, field, end ORDER BY filed DESC, accn DESC) rn
-  FROM obs WHERE filed <= :as_of {where}
+  FROM fact WHERE filed <= :as_of {where}
 ) WHERE rn = 1 ORDER BY cik, field, end
 """
 
@@ -135,7 +169,7 @@ def as_of(con, as_of_date, ticker=None, field=None):
 
 
 def load(con):
-    return pd.read_sql("SELECT * FROM obs", con)
+    return pd.read_sql("SELECT * FROM fact", con)
 
 
 # ---------- restatements ----------
@@ -193,6 +227,43 @@ def reconcile_splits(filing_splits, vendor, since="2009-06-01", max_lag=450):
     for f in filing_splits.drop(index=list(used)).itertuples():
         rows.append(dict(ticker=f.ticker, ratio=f.split_ratio, filings_filed=f.new_filed, status="missing_in_vendor"))
     return pd.DataFrame(rows)
+
+
+def splits_between(vendor, ticker, after, upto):
+    v = vendor[(vendor.ticker == ticker) & (vendor.date > after) & (vendor.date <= upto)]
+    return float(np.prod(v.ratio))
+
+
+def market_cap(fact, price, vendor, jump=0.25):
+    """Price x diluted shares at each fiscal year end, two ways:
+    pit   - the first-reported share count, put on the period-end basis (a split between
+            year end and the filing date is already baked into the filed number);
+    naive - today's restated share count, which is on a later split basis.
+    A share-count jump between years must be explained by a vendor split, or it's flagged."""
+    r = np.maximum(vendor.ratio, 1 / vendor.ratio)
+    vendor = vendor[np.abs(r - r.round()) < 0.01]  # spin-off price adjustments don't change share counts
+    sh = fact[fact.field == "shares_diluted"].sort_values(["filed", "accn"])
+    first = sh.drop_duplicates(["cik", "end"])
+    latest = sh.drop_duplicates(["cik", "end"], keep="last")[["cik", "end", "val"]].rename(columns={"val": "val_latest"})
+    m = first.merge(latest, on=["cik", "end"]).assign(month=lambda d: d.end.str[:7])
+    m = m.merge(price[["ticker", "month", "close_raw"]], on=["ticker", "month"]).sort_values(["ticker", "end"])
+    m["shares_pe"] = [v / splits_between(vendor, t, e, f) for t, e, f, v in zip(m.ticker, m.end, m.filed, m.val)]
+    m["cap_pit"] = m.shares_pe * m.close_raw
+    m["cap_naive"] = m.val_latest * m.close_raw
+    m["naive_error"] = m.cap_naive / m.cap_pit
+    # A restated count reflects the first k splits after the period (old years stop being
+    # re-reported), so the gap should equal one of the running products of those splits.
+    def is_later_splits(t, end, err):
+        r = vendor[(vendor.ticker == t) & (vendor.date > end)].sort_values("date").ratio
+        return bool(np.isclose(err, np.cumprod(r), rtol=0.02).any())
+    m["naive_error_is_later_splits"] = [is_later_splits(t, e, x) for t, e, x in zip(m.ticker, m.end, m.naive_error)]
+    prev = m.groupby("ticker")[["end", "shares_pe"]].shift()
+    expected = [splits_between(vendor, t, pe, e) if pd.notna(pe) else np.nan
+                for t, pe, e in zip(m.ticker, prev.end, m.end)]
+    m["unexplained_share_change"] = m.shares_pe / prev.shares_pe / expected
+    m["flag"] = (np.abs(np.log(m.unexplained_share_change)) > np.log(1 + jump)).fillna(False)
+    return m[["ticker", "end", "filed", "close_raw", "val", "shares_pe", "val_latest",
+              "cap_pit", "cap_naive", "naive_error", "naive_error_is_later_splits", "unexplained_share_change", "flag"]]
 
 
 # ---------- quality: rules + robust z-score ----------
@@ -305,6 +376,9 @@ def report():
     recon = reconcile_splits(splits, vendor)
     no_vendor = pd.read_sql("SELECT ticker FROM vendor_coverage WHERE NOT covered", con).ticker.tolist()
     recon.to_csv(OUT / "split_reconciliation.csv", index=False)
+    mc = market_cap(obs, pd.read_sql("SELECT * FROM price", con), vendor)
+    mc.to_csv(OUT / "market_cap.csv", index=False)
+    naive_bad = mc[np.abs(np.log(mc.naive_error)) > np.log(1.15)]
 
     ident = identity_breaches(snap)
     ident.to_csv(OUT / "identity_breaches.csv", index=False)
@@ -335,11 +409,13 @@ def report():
     unexplained = real_flags[(real_flags.z > 6) & ~real_flags.split_basis]
     sc["anomaly_flags"] = unexplained.groupby("ticker").size()
     sc["restatements_other"] = rev[rev.kind.isin(["other", "amendment"])].groupby("ticker").size()
-    sc = sc.fillna(0).astype({c: int for c in ["identity_breaches", "rule_flags", "anomaly_flags", "restatements_other"]})
+    sc["share_jumps"] = mc[mc.flag].groupby("ticker").size()
+    counts = ["identity_breaches", "rule_flags", "anomaly_flags", "restatements_other", "share_jumps"]
+    sc = sc.fillna(0).astype({c: int for c in counts})
     # Anomaly flags are a review queue, not errors: amber once they're dense (per 100 values).
     density = 100 * sc.anomaly_flags / sc.observations
     sc["rag"] = np.where(sc.identity_breaches + sc.rule_flags > 0, "RED",
-                np.where((density > 3) | (sc.restatements_other > 10), "AMBER", "GREEN"))
+                np.where((density > 3) | (sc.restatements_other > 10) | (sc.share_jumps > 0), "AMBER", "GREEN"))
     sc.to_csv(OUT / "scorecard.csv")
 
     md = [
@@ -352,6 +428,15 @@ def report():
         recon.status.value_counts().to_frame("count").to_markdown(), "",
         recon.to_markdown(index=False), "",
         f"No vendor data (delisted): {', '.join(no_vendor) or 'none'}", "",
+        "## Market cap: price x diluted shares at fiscal year end", "",
+        f"{len(mc)} company-years. Today's restated share count and the as-filed count give market caps "
+        f"more than 15% apart in {len(naive_bad)} of them. {int(naive_bad.naive_error_is_later_splits.sum())} "
+        f"are exactly the later splits (today's count is on the wrong basis for the traded price); "
+        f"the other {int((~naive_bad.naive_error_is_later_splits).sum())}: "
+        f"{', '.join(sorted(set(naive_bad.ticker[~naive_bad.naive_error_is_later_splits]))) or 'none'}.", "",
+        f"Share-count changes of more than 25% not explained by a vendor split: {int(mc.flag.sum())}", "",
+        mc[mc.flag][["ticker", "end", "filed", "val", "shares_pe", "unexplained_share_change"]]
+            .round(3).to_markdown(index=False), "",
         f"## Accounting identity breaches (Assets vs LiabilitiesAndStockholdersEquity, >0.5%): {len(ident)}", "",
         ident.to_markdown(index=False), "",
         f"## Flags on real data (no injection): {len(real_flags)}, "
@@ -369,6 +454,119 @@ def report():
     ]
     (OUT / "report.md").write_text("\n".join(md))
     print("\n".join(md))
+    charts(snap, real, rev, recon, sweep, ev, mc)
+
+
+# ---------- charts ----------
+# Reference palette (dataviz skill), light mode: categorical slots in fixed order + status critical.
+INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
+CRITICAL = "#d03b3b"
+
+
+def charts(snap, real, rev, recon, sweep, ev, mc):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "axes.edgecolor": GRID,
+                         "axes.labelcolor": MUTED, "xtick.color": MUTED, "ytick.color": MUTED, "text.color": INK,
+                         "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8, "axes.axisbelow": True,
+                         "axes.spines.top": False, "axes.spines.right": False, "font.size": 10,
+                         "axes.titlesize": 12, "axes.titleweight": "bold", "axes.titlelocation": "left",
+                         "legend.frameon": False})
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
+    def human(v, _):
+        for u, sfx in [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]:
+            if v >= u:
+                return f"{v / u:g}{sfx}"
+        return f"{v:g}"
+
+    def log_y(ax, subs=(1.0,)):
+        ax.set_yscale("log")
+        ax.yaxis.set_major_locator(LogLocator(subs=subs))
+        ax.yaxis.set_major_formatter(FuncFormatter(human))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+
+    d = OUT / "charts"
+    d.mkdir(exist_ok=True)
+
+    # 1. A flagged value on its series: NVIDIA's 1000x share-count error.
+    s = real[(real.ticker == "NVDA") & (real.field == "shares_diluted")]
+    x = pd.to_datetime(s.end)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(x, s.val, color=SERIES[0], lw=2, marker="o", ms=5)
+    bad = s.scale
+    ax.scatter(x[bad], s.val[bad], s=90, color=CRITICAL, zorder=3, edgecolor=SURFACE, linewidth=2)
+    vals = " and ".join(f"{v:,.0f}" for v in s.val[bad])
+    ax.annotate(f"Flagged: FY2008-09 filed as {vals}\n(about 1000x too small)", (x[bad].iloc[-1], s.val[bad].iloc[-1]),
+                xytext=(18, 10), textcoords="offset points", color=INK, fontsize=9)
+    log_y(ax)
+    ax.set_ylabel("diluted shares (log scale)")
+    ax.set_title("NVIDIA diluted share count, latest-known values", pad=22)
+    ax.text(0, 1.03, "Red points fail the scale rule. The later steps are the 2021 and 2024 splits: "
+            "older years were never restated.",
+            transform=ax.transAxes, color=MUTED, fontsize=9)
+    fig.tight_layout(); fig.savefig(d / "nvda_scale_error.png", dpi=150); plt.close(fig)
+
+    # 2. Revisions per filing year, by kind (stacked).
+    kinds = ["other", "split", "amendment", "rounding"]
+    t = rev.assign(year=rev.new_filed.str[:4]).pivot_table(index="year", columns="kind", values="end",
+                                                           aggfunc="size", fill_value=0).reindex(columns=kinds, fill_value=0)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bottom = np.zeros(len(t))
+    for k, c in zip(kinds, SERIES):
+        ax.bar(t.index, t[k], bottom=bottom, color=c, label=k, edgecolor=SURFACE, linewidth=1.5, width=0.75)
+        bottom += t[k].to_numpy()
+    ax.set_ylabel("revised values")
+    ax.set_ylim(top=bottom.max() * 1.18)
+    ax.set_title("Revisions of already-reported values, by year of the revising filing")
+    ax.legend(ncol=4, loc="upper left")
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(axis="x", visible=False)
+    fig.tight_layout(); fig.savefig(d / "revisions_by_year.png", dpi=150); plt.close(fig)
+
+    # 3. Days from the split to the first filing that restates for it.
+    m = recon[recon.status == "matched"].sort_values("lag_days")
+    labels = [f"{tk} {dt[:4]} ({'1:%d' % round(1 / r) if r < 1 else '%d:1' % r})"
+              for tk, dt, r in zip(m.ticker, m.vendor_date, m.ratio)]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.barh(labels, m.lag_days, color=SERIES[0], height=0.6)
+    for i, v in enumerate(m.lag_days):
+        ax.text(v + 3, i, f"{int(v)}", va="center", color=MUTED, fontsize=9)
+    ax.set_xlabel("days from split to first restated filing")
+    ax.set_title("Splits matched between vendor data and SEC filings")
+    ax.grid(axis="y", visible=False)
+    fig.tight_layout(); fig.savefig(d / "split_lag.png", dpi=150); plt.close(fig)
+
+    # 4. Precision/recall: rules alone vs rules + z-score across thresholds.
+    comb = sweep.xs("combined", level=1)
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.plot(comb.recall, comb.precision, color=SERIES[0], lw=2, marker="o", ms=6, label="rules + robust z")
+    for th, r in comb.iterrows():
+        ax.annotate(f"z > {th}", (r.recall, r.precision), xytext=(6, 4), textcoords="offset points",
+                    color=MUTED, fontsize=9)
+    ax.scatter([ev.loc["rules", "recall"]], [ev.loc["rules", "precision"]], s=70, color=SERIES[1],
+               zorder=3, label="rules alone")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+    ax.set_xlabel("recall on injected errors"); ax.set_ylabel("precision")
+    ax.set_title("Detection tradeoff (mean of 5 injection seeds)")
+    ax.legend(loc="lower left")
+    fig.tight_layout(); fig.savefig(d / "eval_tradeoff.png", dpi=150); plt.close(fig)
+
+    # 5. Why point-in-time matters: Apple market cap with today's vs as-filed share counts.
+    a = mc[mc.ticker == "AAPL"]
+    x = pd.to_datetime(a.end)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(x, a.cap_pit / 1e9, color=SERIES[0], lw=2, marker="o", ms=5, label="as-filed shares (point-in-time)")
+    ax.plot(x, a.cap_naive / 1e9, color=SERIES[1], lw=2, marker="o", ms=5, label="today's restated shares")
+    log_y(ax, subs=(1.0, 2.0, 5.0))
+    ax.set_ylabel("market cap, $bn (log scale)")
+    ax.set_title("Apple market cap at fiscal year end: price x diluted shares", pad=22)
+    ax.text(0, 1.03, "Gaps: years where today's count was restated for a split that came after the price.",
+            transform=ax.transAxes, color=MUTED, fontsize=9)
+    ax.legend(loc="lower right")
+    fig.tight_layout(); fig.savefig(d / "aapl_market_cap.png", dpi=150); plt.close(fig)
 
 
 # ---------- self-check ----------
@@ -385,7 +583,7 @@ def selftest():
     rv = revisions(obs)
     assert sorted(rv.kind) == ["amendment", "split"], rv
     con = sqlite3.connect(":memory:")
-    obs.to_sql("obs", con, index=False)
+    obs.to_sql("fact", con, index=False)
     pit = as_of(con, "2021-03-01")
     assert set(pit.val) == {100, 50} and (pit.filed <= "2021-03-01").all()  # no look-ahead
     assert set(as_of(con, "2030-01-01").val) == {400, 55}
@@ -393,6 +591,13 @@ def selftest():
                           val=[100.0 + i for i in range(12)]))
     s.loc[6, "val"] = 106_000.0
     assert rules(s).scale[6] and robust_z(s).idxmax() == 6
+    # Split after year end but before the 10-K: the filed count is post-split, the price isn't.
+    fact = pd.DataFrame(dict(ticker="W", cik=1, field="shares_diluted", end=["2023-01-31", "2024-01-31"],
+                             filed=["2023-03-10", "2024-03-15"], accn=["a", "b"], val=[2.7e9, 8.1e9]))
+    price = pd.DataFrame(dict(ticker="W", month=["2023-01", "2024-01"], close_raw=[140.0, 165.0]))
+    vendor = pd.DataFrame(dict(ticker="W", date=["2024-02-26"], ratio=[3.0]))
+    mc = market_cap(fact, price, vendor)
+    assert np.allclose(mc.shares_pe, [2.7e9, 2.7e9]) and not mc.flag.any(), mc
     print("selftest ok")
 
 
