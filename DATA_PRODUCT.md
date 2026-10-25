@@ -9,7 +9,7 @@
 | Risk / portfolio analytics | Market cap, leverage and exposure reports | Correct scale and sign; market cap that matches the traded price | Scale and sign rules, market-cap check |
 | Data operations | Owns the feed and triages exceptions | A short, ranked exception queue with an explanation for each flag | Scorecard, split-explained vs unexplained flags, vendor reconciliation |
 
-The researcher and the analyst want different "truths" for the same cell. The researcher needs the value as filed, and the analyst needs the latest restated value. The bitemporal model serves both from one table: `as_of(date)` for the first, `as_of(today)` for the second. Mixing them up is the most expensive error a user can make with this data. The Apple market-cap chart shows the effect: 29 company-years are off by 2–50× when today's share count is used with the historical price.
+The researcher and the analyst want different "truths" for the same cell. The researcher needs the value as filed, and the analyst needs the latest restated value. The bitemporal model serves both from one table: `as_of(date)` for the first, `as_of(today)` for the second. Mixing them up is the most expensive error a user can make with this data. The Apple market-cap chart shows the effect: 38 of 674 company-years are off by a factor of 2 to 50 (8 for GE's reverse split) when today's share count is used with the historical price.
 
 ## Service levels this would need in production
 
@@ -42,4 +42,5 @@ Security master: OpenFIGI mapping by today's ticker on US exchanges. It is not p
 1. Multi-class issuers that report EPS and share counts only per class (Visa) have no `eps_diluted` or `shares_diluted`.
 2. Predecessor filers (Google Inc. before Alphabet) aren't linked, so history starts at the newer CIK.
 3. There are no quarterly flows yet. They need Q4 derived as the full year minus nine months.
-4. Stale values (a number carried forward unchanged) are not detected.
+4. Stale values (a number carried forward unchanged) and shifted periods (a neighbouring period's value) are not detected: on injected errors both rules and the z-score catch about 3%.
+5. `companyfacts` can silently omit filings: Q2 2026 10-Qs for KO, V and XOM are missing. The missed-filing check catches this. Telling a late filer from a feed gap or a successor CIK needs the submissions API.

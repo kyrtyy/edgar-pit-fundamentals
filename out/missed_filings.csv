@@ -1,0 +1,11 @@
+ticker,last_filed,next_filed,gap_days,status
+ATVI,2023-07-31,,1180,ceased filing (acquired)
+CELG,2019-10-31,,2549,ceased filing (acquired)
+KO,2026-04-30,,176,overdue
+MON,2018-04-05,,3123,ceased filing (acquired)
+RTN,2020-02-12,,2445,ceased filing (acquired)
+TWTR,2022-07-26,,1550,ceased filing (acquired)
+TWX,2018-04-26,,3102,ceased filing (acquired)
+V,2026-04-29,,177,overdue
+XLNX,2022-01-27,,1730,ceased filing (acquired)
+XOM,2026-05-04,,172,overdue

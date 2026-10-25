@@ -1,11 +1,21 @@
-z_thresh,method,precision,recall,recall_drift
-4,robust_z,0.229,0.681,0.69
-4,combined,0.229,0.683,0.69
-6,robust_z,0.353,0.635,0.559
-6,combined,0.355,0.641,0.559
-8,robust_z,0.434,0.581,0.396
-8,combined,0.439,0.595,0.396
-12,robust_z,0.524,0.521,0.269
-12,combined,0.534,0.556,0.269
-20,robust_z,0.623,0.435,0.053
-20,combined,0.642,0.493,0.053
+z_thresh,if_rate,method,precision,recall,recall_drift
+4,0.1,robust_z,0.197,0.552,0.653
+4,0.1,iforest,0.095,0.48,0.231
+4,0.1,rules + robust_z,0.197,0.552,0.653
+4,0.1,rules + iforest,0.095,0.48,0.231
+6,0.05,robust_z,0.298,0.516,0.569
+6,0.05,iforest,0.17,0.432,0.075
+6,0.05,rules + robust_z,0.299,0.52,0.569
+6,0.05,rules + iforest,0.17,0.432,0.075
+8,0.03,robust_z,0.371,0.484,0.456
+8,0.03,iforest,0.277,0.422,0.05
+8,0.03,rules + robust_z,0.375,0.493,0.456
+8,0.03,rules + iforest,0.277,0.423,0.05
+12,0.02,robust_z,0.454,0.423,0.275
+12,0.02,iforest,0.364,0.37,0.028
+12,0.02,rules + robust_z,0.466,0.451,0.275
+12,0.02,rules + iforest,0.383,0.403,0.028
+20,0.01,robust_z,0.559,0.362,0.075
+20,0.01,iforest,0.415,0.211,0.008
+20,0.01,rules + robust_z,0.579,0.404,0.075
+20,0.01,rules + iforest,0.541,0.36,0.008

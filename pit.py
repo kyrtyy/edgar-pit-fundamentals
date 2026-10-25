@@ -3,7 +3,8 @@
 Usage:
   python pit.py ingest                 # fetch companyfacts -> facts.db
   python pit.py asof AAPL revenue 2019-06-30
-  python pit.py report                 # restatements, checks, eval -> out/
+  python pit.py serve [port]           # GET /bdh?ticker=&fields=&start=&end=&as_of=
+  python pit.py report                 # restatements, checks, eval -> out/ (incl. dashboard.html)
   python pit.py selftest
 """
 import json, os, sqlite3, sys, time, urllib.error, urllib.request
@@ -25,8 +26,15 @@ COMPANIES = {
     "V": 1403161, "UNH": 731766, "HD": 354950, "KO": 21344,
     "PEP": 77476, "INTC": 50863, "CSCO": 858877, "ORCL": 1341439,
     "NFLX": 1065280, "AVGO": 1730168, "CMG": 1058090, "GE": 40545,
+    "LLY": 59478, "MA": 1141391, "ABBV": 1551152, "MRK": 310158,
+    "PFE": 78003, "BAC": 70858, "CVX": 93410, "COST": 909832,
+    "ADBE": 796343, "CRM": 1108524, "AMD": 2488, "MCD": 63908,
+    "NKE": 320187, "VZ": 732712, "IBM": 51143, "QCOM": 804328,
+    "TXN": 97476, "BA": 12927, "CAT": 18230,
     "TWTR": 1418091, "ATVI": 718877, "XLNX": 743988,
+    "CELG": 816284, "MON": 1110783, "RTN": 1047122, "TWX": 1105705,
 }
+ACQUIRED = {"TWTR", "ATVI", "XLNX", "CELG", "MON", "RTN", "TWX"}  # stop filing by design, not a missed deadline
 
 # canonical field -> (kind, tags in priority order). Flows are annual only:
 # 10-Q flows are year-to-date and Q4 is never filed, so quarterly flows need derivation.
@@ -168,6 +176,45 @@ def as_of(con, as_of_date, ticker=None, field=None):
     return pd.read_sql(ASOF_SQL.format(where=where), con, params=params).drop(columns="rn")
 
 
+def bdh(con, ticker, fields, start, end, as_of_date):
+    """BDH-style history: one row per period in [start, end], one column per field, using
+    only what was filed on or before as_of_date."""
+    d = as_of(con, as_of_date, ticker)
+    d = d[d.field.isin(fields) & (d.end >= start) & (d.end <= end)]
+    return d.pivot_table(index="end", columns="field", values="val").reindex(columns=fields).reset_index()
+
+
+def serve(port=8000):
+    """GET /bdh?ticker=AAPL&fields=revenue,eps_diluted&start=2015-01-01&end=2020-12-31&as_of=2019-06-30"""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            try:
+                if u.path != "/bdh":
+                    raise LookupError("only /bdh")
+                fields = q["fields"].split(",")
+                unknown = set(fields) - set(FIELDS)
+                if unknown:
+                    raise ValueError(f"unknown fields: {sorted(unknown)}")
+                with sqlite3.connect(DB) as con:
+                    df = bdh(con, q["ticker"], fields, q.get("start", "0000"), q.get("end", "9999"),
+                             q.get("as_of", "9999-12-31"))
+                code, body = 200, df.to_json(orient="records")
+            except (KeyError, ValueError, LookupError) as e:
+                code, body = 400, json.dumps({"error": str(e)})
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+    print(f"http://localhost:{port}/bdh?ticker=AAPL&fields=revenue,shares_diluted&as_of=2020-06-30")
+    HTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
 def load(con):
     return pd.read_sql("SELECT * FROM fact", con)
 
@@ -296,6 +343,25 @@ def identity_breaches(s, tol=0.005):
     return w[w.gap.abs() > tol].reset_index()
 
 
+def missed_filings(filing, company, today, max_gap=150, since="2011-06-15"):
+    """Expected 10-Q/10-K that hasn't arrived. Large accelerated filers file a 10-Q within
+    40 days of quarter end and a 10-K within 60 of year end, so consecutive filings are
+    ~3 months apart (16-week fiscal quarters, e.g. Costco, stretch that to ~140 days),
+    so >150 days means one is missing. Starts after XBRL phase-in."""
+    rows = []
+    f = filing[filing.form.isin(FORMS)].merge(company[["cik", "ticker"]], on="cik")  # e.g. MSFT Jan 2012 is a 10-Q/A
+    for t, g in f[f.filed >= since].groupby("ticker"):
+        d = pd.to_datetime(g.filed).sort_values().tolist() + [pd.Timestamp(today)]
+        for a, b in zip(d, d[1:]):
+            gap = (b - a).days
+            if gap > max_gap:
+                last = b == d[-1]
+                rows.append(dict(ticker=t, last_filed=a.date().isoformat(), next_filed=None if last else b.date().isoformat(),
+                                 gap_days=gap, status="ceased filing (acquired)" if last and t in ACQUIRED
+                                 else "overdue" if last else "gap"))
+    return pd.DataFrame(rows, columns=["ticker", "last_filed", "next_filed", "gap_days", "status"])
+
+
 def robust_z(s, k=2, min_len=6):
     """|z| of each point's relative gap to the median of its k neighbours each side, scaled by
     the series' robust spread. Uses future neighbours: this is retrospective QA, not a signal."""
@@ -312,21 +378,48 @@ def robust_z(s, k=2, min_len=6):
     return z
 
 
+def features(s, k=2):
+    """Scale-free per-value features, so one model can be fit across all series:
+    gap to the neighbour median, log-ratio to it and to each adjacent period, sign flip."""
+    cols = ["gap", "log_nb", "log_prev", "log_next", "sign_flip"]
+    X = pd.DataFrame(0.0, index=s.index, columns=cols)
+    for _, g in s.groupby(["cik", "field"]):
+        v = g["val"].to_numpy(float)
+        nb = neighbour_median(v, k)
+        a = np.log(np.abs(v) + 1e-9)
+        X.loc[g.index, cols] = np.c_[
+            (v - nb) / np.maximum(np.abs(nb), 0.1 * np.median(np.abs(v)) + 1e-9),
+            a - np.log(np.abs(nb) + 1e-9), np.r_[0, np.diff(a)], np.r_[np.diff(a), 0],
+            np.sign(v) != np.sign(nb)]
+    return X.clip(-50, 50)
+
+
+def iforest(s, seed=0):
+    """Isolation-forest anomaly score (higher = more anomalous), fit on all series pooled."""
+    from sklearn.ensemble import IsolationForest
+    X = features(s)
+    return pd.Series(-IsolationForest(n_estimators=300, random_state=seed, n_jobs=-1).fit(X).score_samples(X),
+                     index=s.index)
+
+
 # ---------- evaluation with injected errors ----------
+
+ERR_KINDS = ["scale", "sign", "stale", "drift", "shift"]  # rules target scale+sign; the rest held out
+
 
 def inject(s, rate=0.02, seed=0):
     rng = np.random.default_rng(seed)
     s = s.copy()
     s["err"] = ""
     idx = rng.choice(s.index, size=int(len(s) * rate), replace=False)
-    kinds = ["scale", "sign", "stale", "drift"]  # rules target scale+sign; stale+drift held out
     for n, i in enumerate(idx):
-        kind, v = kinds[n % 4], s.at[i, "val"]
-        same = s[(s.cik == s.at[i, "cik"]) & (s.field == s.at[i, "field"]) & (s.end < s.at[i, "end"])]
-        if kind == "stale":
-            if same.empty or same["val"].iloc[-1] == v:
+        kind, v = ERR_KINDS[n % len(ERR_KINDS)], s.at[i, "val"]
+        same = s[(s.cik == s.at[i, "cik"]) & (s.field == s.at[i, "field"])]
+        if kind in ("stale", "shift"):  # previous period carried forward / next period's value
+            other = same[same.end < s.at[i, "end"]] if kind == "stale" else same[same.end > s.at[i, "end"]]
+            if other.empty:
                 continue
-            new = same["val"].iloc[-1]
+            new = other["val"].iloc[-1 if kind == "stale" else 0]
         else:
             new = {"scale": v * 1000, "sign": -v, "drift": v * rng.choice([0.7, 1.3])}[kind]
         if new == v:
@@ -341,16 +434,20 @@ def pr(flag, truth):
                 precision=round(tp / max(flag.sum(), 1), 3), recall=round(tp / max(truth.sum(), 1), 3))
 
 
-def evaluate(s, z_thresh=6.0, seeds=range(5)):
+def evaluate(s, z_thresh=6.0, if_rate=0.03, seeds=range(5)):
+    """if_rate: the isolation forest flags its top if_rate share of values."""
     rows = []
     for seed in seeds:
         d = inject(s, seed=seed)
         truth = d["err"] != ""
         r = rules(d).any(axis=1)
         z = robust_z(d) > z_thresh
-        for name, flag in [("rules", r), ("robust_z", z), ("combined", r | z)]:
+        f = iforest(d, seed)
+        f = f > f.quantile(1 - if_rate)
+        for name, flag in [("rules", r), ("robust_z", z), ("iforest", f),
+                           ("rules + robust_z", r | z), ("rules + iforest", r | f)]:
             row = dict(seed=seed, method=name, **pr(flag, truth))
-            for kind in ["scale", "sign", "stale", "drift"]:
+            for kind in ERR_KINDS:
                 m = d["err"] == kind
                 row[f"recall_{kind}"] = round((flag & m).sum() / max(m.sum(), 1), 3)
             rows.append(row)
@@ -382,6 +479,11 @@ def report():
 
     ident = identity_breaches(snap)
     ident.to_csv(OUT / "identity_breaches.csv", index=False)
+    # "Today" is the feed's latest filing date, so a re-run on the same facts.db reproduces.
+    filing = pd.read_sql("SELECT * FROM filing", con)
+    missed = missed_filings(filing, pd.read_sql("SELECT * FROM company", con), filing.filed.max())
+    missed.to_csv(OUT / "missed_filings.csv", index=False)
+    late = missed[missed.status != "ceased filing (acquired)"]
     rf = rules(snap)
     z = robust_z(snap)
     real = snap.assign(scale=rf.scale, sign=rf.sign, z=z.round(1))
@@ -397,9 +499,12 @@ def report():
 
     ev = evaluate(snap)
     ev.to_csv(OUT / "eval.csv")
-    sweep = pd.concat({t: evaluate(snap, z_thresh=t).loc[["robust_z", "combined"],
-                                                         ["precision", "recall", "recall_drift"]]
-                       for t in [4, 6, 8, 12, 20]}, names=["z_thresh"])
+    # Each step tightens both detectors: z threshold up, iforest flag rate down.
+    sweep = pd.concat({(t, q): evaluate(snap, z_thresh=t, if_rate=q).loc[
+                           ["robust_z", "iforest", "rules + robust_z", "rules + iforest"],
+                           ["precision", "recall", "recall_drift"]]
+                       for t, q in [(4, 0.1), (6, 0.05), (8, 0.03), (12, 0.02), (20, 0.01)]},
+                      names=["z_thresh", "if_rate"])
     sweep.to_csv(OUT / "eval_sweep.csv")
 
     # RAG scorecard per company
@@ -410,12 +515,14 @@ def report():
     sc["anomaly_flags"] = unexplained.groupby("ticker").size()
     sc["restatements_other"] = rev[rev.kind.isin(["other", "amendment"])].groupby("ticker").size()
     sc["share_jumps"] = mc[mc.flag].groupby("ticker").size()
-    counts = ["identity_breaches", "rule_flags", "anomaly_flags", "restatements_other", "share_jumps"]
+    sc["missed_filings"] = late.groupby("ticker").size()
+    counts = ["identity_breaches", "rule_flags", "anomaly_flags", "restatements_other", "share_jumps", "missed_filings"]
     sc = sc.fillna(0).astype({c: int for c in counts})
     # Anomaly flags are a review queue, not errors: amber once they're dense (per 100 values).
     density = 100 * sc.anomaly_flags / sc.observations
     sc["rag"] = np.where(sc.identity_breaches + sc.rule_flags > 0, "RED",
-                np.where((density > 3) | (sc.restatements_other > 10) | (sc.share_jumps > 0), "AMBER", "GREEN"))
+                np.where((density > 3) | (sc.restatements_other > 10) | (sc.share_jumps > 0) | (sc.missed_filings > 0),
+                         "AMBER", "GREEN"))
     sc.to_csv(OUT / "scorecard.csv")
 
     md = [
@@ -447,14 +554,69 @@ def report():
         "Top anomaly flags not explained by splits:", "",
         real_flags[~real_flags.split_basis].nlargest(25, "z")[["ticker", "field", "end", "val", "z"]]
             .to_markdown(index=False), "",
-        "## Detector evaluation (injected errors, 2% of values, mean of 5 seeds, z > 6)", "",
-        "Rules target scale and sign errors; stale and drift are held out.", "", ev.to_markdown(), "",
+        f"## Missed filings (10-Q/10-K gap > 150 days since 2011-06): {len(late)}, "
+        f"plus {len(missed) - len(late)} acquired companies that stopped filing", "",
+        missed.to_markdown(index=False), "",
+        "## Detector evaluation (injected errors, 2% of values, mean of 5 seeds, z > 6, iforest top 3%)", "",
+        "Rules target scale and sign errors; stale, drift and shift are held out.", "", ev.to_markdown(), "",
         "Threshold sweep:", "", sweep.to_markdown(), "",
         "## Scorecard", "", sc.to_markdown(), "",
     ]
     (OUT / "report.md").write_text("\n".join(md))
     print("\n".join(md))
     charts(snap, real, rev, recon, sweep, ev, mc)
+
+    exceptions = pd.concat([
+        real_flags[real_flags.scale | real_flags.sign].assign(
+            check=lambda d: np.where(d.scale, "scale", "sign"), detail=lambda d: d.val.map("{:,.0f}".format)),
+        ident.assign(check="identity", detail=ident.gap.map("assets vs L+E off {:.1%}".format)),
+        mc[mc.flag].assign(check="share jump", detail=mc.unexplained_share_change.map("unexplained x{:.2f}".format)),
+        late.assign(check="missed filing", end=late.last_filed,
+                    detail=late.gap_days.astype(str) + " days without a 10-Q/10-K (" + late.status + ")"),
+        unexplained.nlargest(15, "z").assign(check="anomaly", detail=lambda d: "z = " + d.z.astype(str)),
+    ])[["check", "ticker", "field", "end", "detail"]].fillna("")
+    restated = (rev[rev.kind.isin(["other", "amendment"])].sort_values("new_filed", ascending=False)
+                [["ticker", "field", "end", "old", "new", "old_filed", "new_filed", "new_form", "kind"]])
+    dashboard(sc, exceptions, restated)
+
+
+def dashboard(sc, exceptions, restated):
+    """Static data-quality dashboard: scorecard, open exceptions, restatement history, charts."""
+    colors = {"RED": CRITICAL, "AMBER": SERIES[3], "GREEN": SERIES[2]}
+    rag = sc.rag.value_counts().reindex(["RED", "AMBER", "GREEN"], fill_value=0)
+    tiles = "".join(f'<div class="tile"><b style="color:{colors[k]}">{n}</b>{k}</div>' for k, n in rag.items())
+    table = sc.reset_index()[["ticker", "rag"] + [c for c in sc if c != "rag"]].to_html(index=False, classes="t", border=0)
+    for k, c in colors.items():
+        table = table.replace(f"<td>{k}</td>", f'<td><span class="pill" style="background:{c}">{k}</span></td>')
+    pd.options.display.float_format = lambda v: f"{v:,.0f}" if abs(v) >= 1000 else f"{v:.2f}"
+    charts_html = "".join(f'<figure><img src="charts/{p}.png" alt="{p}"></figure>' for p in
+                          ["nvda_scale_error", "aapl_market_cap", "revisions_by_year", "split_lag", "eval_tradeoff"])
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Fundamentals data quality</title>
+<style>
+body {{ font: 14px/1.45 system-ui, sans-serif; color: {INK}; background: {SURFACE}; margin: 0 auto; max-width: 1100px; padding: 24px 16px; }}
+h2 {{ margin-top: 2em; }} .muted {{ color: {MUTED}; }}
+.tiles {{ display: flex; gap: 12px; }} .tile {{ border: 1px solid {GRID}; border-radius: 8px; padding: 10px 18px; }}
+.tile b {{ display: block; font-size: 28px; }}
+.scroll {{ overflow-x: auto; max-height: 480px; overflow-y: auto; }}
+.t {{ border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }}
+.t th {{ position: sticky; top: 0; background: {SURFACE}; text-align: left; border-bottom: 2px solid {GRID}; }}
+.t th, .t td {{ padding: 4px 10px; border-bottom: 1px solid {GRID}; white-space: nowrap; }}
+.pill {{ color: #fff; border-radius: 10px; padding: 1px 8px; font-size: 12px; font-weight: 600; }}
+figure {{ margin: 0 0 20px; }} img {{ max-width: 100%; }}
+</style></head><body>
+<h1>Point-in-time fundamentals: data quality</h1>
+<p class="muted">Generated {pd.Timestamp.today():%Y-%m-%d} by <code>pit.py report</code>. RED: identity breach or rule flag.
+AMBER: dense anomaly flags, many restatements, an unexplained share jump or a missed filing.</p>
+<div class="tiles">{tiles}</div>
+<h2>Scorecard</h2><div class="scroll">{table}</div>
+<h2>Open exceptions ({len(exceptions)})</h2><div class="scroll">{exceptions.to_html(index=False, classes="t", border=0)}</div>
+<h2>Restatement history ({len(restated)} non-split, non-rounding revisions)</h2>
+<div class="scroll">{restated.to_html(index=False, classes="t", border=0)}</div>
+<h2>Flagged values</h2>{charts_html}
+</body></html>"""
+    pd.reset_option("display.float_format")
+    (OUT / "dashboard.html").write_text(html)
 
 
 # ---------- charts ----------
@@ -539,13 +701,14 @@ def charts(snap, real, rev, recon, sweep, ev, mc):
     ax.grid(axis="y", visible=False)
     fig.tight_layout(); fig.savefig(d / "split_lag.png", dpi=150); plt.close(fig)
 
-    # 4. Precision/recall: rules alone vs rules + z-score across thresholds.
-    comb = sweep.xs("combined", level=1)
+    # 4. Precision/recall: rules alone vs rules + each detector across thresholds.
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    ax.plot(comb.recall, comb.precision, color=SERIES[0], lw=2, marker="o", ms=6, label="rules + robust z")
-    for th, r in comb.iterrows():
-        ax.annotate(f"z > {th}", (r.recall, r.precision), xytext=(6, 4), textcoords="offset points",
-                    color=MUTED, fontsize=9)
+    for method, c, lab in [("rules + robust_z", SERIES[0], "z > {}"), ("rules + iforest", SERIES[2], "top {:.0%}")]:
+        comb = sweep.xs(method, level=2)
+        ax.plot(comb.recall, comb.precision, color=c, lw=2, marker="o", ms=6, label=method.replace("_", " "))
+        for (th, q), r in comb.iterrows():
+            ax.annotate(lab.format(th if "z" in lab else q), (r.recall, r.precision), xytext=(6, 4),
+                        textcoords="offset points", color=MUTED, fontsize=9)
     ax.scatter([ev.loc["rules", "recall"]], [ev.loc["rules", "precision"]], s=70, color=SERIES[1],
                zorder=3, label="rules alone")
     ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
@@ -590,7 +753,7 @@ def selftest():
     s = pd.DataFrame(dict(cik=1, field="assets", end=[f"20{y}" for y in range(10, 22)],
                           val=[100.0 + i for i in range(12)]))
     s.loc[6, "val"] = 106_000.0
-    assert rules(s).scale[6] and robust_z(s).idxmax() == 6
+    assert rules(s).scale[6] and robust_z(s).idxmax() == 6 and iforest(s).idxmax() == 6
     # Split after year end but before the 10-K: the filed count is post-split, the price isn't.
     fact = pd.DataFrame(dict(ticker="W", cik=1, field="shares_diluted", end=["2023-01-31", "2024-01-31"],
                              filed=["2023-03-10", "2024-03-15"], accn=["a", "b"], val=[2.7e9, 8.1e9]))
@@ -598,6 +761,18 @@ def selftest():
     vendor = pd.DataFrame(dict(ticker="W", date=["2024-02-26"], ratio=[3.0]))
     mc = market_cap(fact, price, vendor)
     assert np.allclose(mc.shares_pe, [2.7e9, 2.7e9]) and not mc.flag.any(), mc
+    # Missed filings: a 200-day hole is a gap; an acquired company going quiet is not overdue.
+    filing = pd.DataFrame(dict(cik=[1, 1, 1, 2], form="10-Q", filed=["2020-01-01", "2020-04-01", "2020-10-18", "2020-01-01"]))
+    company = pd.DataFrame(dict(cik=[1, 2], ticker=["X", "TWTR"]))
+    mf = missed_filings(filing, company, "2020-12-01", since="2019")
+    assert list(mf.status) == ["ceased filing (acquired)", "gap"] and mf.gap_days.iloc[1] == 200, mf
+    # BDH: as-of hides the later restatement; injected shifts take the next period's value.
+    assert bdh(con, "X", ["shares_diluted", "revenue"], "2020", "2021", "2021-03-01").values.tolist() == \
+        [["2020-12-31", 100, 50]]
+    s2 = s.assign(ticker="X")
+    d = inject(s2, rate=0.5, seed=1)
+    for i in d.index[d.err == "shift"]:
+        assert d.at[i, "val"] == s2.at[i + 1, "val"]
     print("selftest ok")
 
 
@@ -608,6 +783,8 @@ if __name__ == "__main__":
     elif cmd == "asof":
         _, _, ticker, field, date = sys.argv
         print(as_of(sqlite3.connect(DB), date, ticker, field).tail(12).to_string(index=False))
+    elif cmd == "serve":
+        serve(int(sys.argv[2]) if len(sys.argv) > 2 else 8000)
     elif cmd == "report":
         report()
     elif cmd == "selftest":
